@@ -108,6 +108,7 @@ const API_BASE = "https://roscoe.rayward.app";
 const CACHE_STORE_KEY = "RotectorFlags_cache_v3";
 const CACHE_TTL_MS = 24 * 60 * 60 * 1000; // hard 24h ceiling per API terms — do not raise this
 const NOT_CONFIGURED_FLAG = -1; // sentinel: no API key set, distinct from a real 0 (Unflagged) result
+const LOOKUP_FAILED_FLAG = -3; // sentinel: automatic retries exhausted — a real "I tried and gave up", not "still checking"
 
 function authHeader() {
     const key = settings.store.apiKey?.trim();
@@ -262,6 +263,18 @@ class ProviderLookup {
     private inFlight = new Set<string>();
     private flushTimer: ReturnType<typeof setTimeout> | null = null;
     private subscribers = new Map<string, Set<() => void>>();
+    // Per-id auto-retry count. This is the actual fix: previously a failed
+    // batch (non-200, success:false, or a thrown exception) just left the id
+    // permanently uncached with nothing left to ever re-queue it — since the
+    // only thing that calls queueLookup is a component's mount effect, a
+    // badge that stayed on screen without remounting was stuck in
+    // "Checking…" forever, even though the request itself had long since
+    // failed. Now a failure schedules its own retry with capped backoff, and
+    // if every retry fails too, it settles into a visible LOOKUP_FAILED_FLAG
+    // state instead of spinning indefinitely.
+    private retries = new Map<string, number>();
+    private static readonly MAX_RETRIES = 5;
+    private static readonly RETRY_BASE_MS = 3000;
 
     constructor(public readonly provider: AnyProviderId, public readonly kind: LookupKind) { }
 
@@ -294,8 +307,30 @@ class ProviderLookup {
     /** Bypasses the 24h cache for one user and re-queues an immediate lookup. */
     forceRefresh(id: string) {
         this.cache.delete(id);
+        this.retries.delete(id); // manual refresh always gets a fresh attempt, not a continuation of a dead backoff
         this.notify(id); // flip the UI to "Checking…" right away
         this.queueLookup(id);
+    }
+
+    /**
+     * Called for any id that didn't end up cached after a flush attempt —
+     * schedules another try with exponential backoff (3s, 6s, 12s, 24s,
+     * 48s), capped at MAX_RETRIES. Past the cap, caches a visible
+     * LOOKUP_FAILED_FLAG entry instead of retrying forever, so the UI shows
+     * "couldn't reach this provider" rather than looking identical to a
+     * normal in-progress check.
+     */
+    private scheduleRetry(id: string) {
+        const attempt = (this.retries.get(id) ?? 0) + 1;
+        if (attempt > ProviderLookup.MAX_RETRIES) {
+            this.retries.delete(id);
+            this.cache.set(id, { id, flagType: LOOKUP_FAILED_FLAG, fetchedAt: Date.now() });
+            this.notify(id);
+            return;
+        }
+        this.retries.set(id, attempt);
+        const delay = ProviderLookup.RETRY_BASE_MS * 2 ** (attempt - 1);
+        setTimeout(() => this.queueLookup(id), delay);
     }
 
     private async flush() {
@@ -326,8 +361,9 @@ class ProviderLookup {
             });
 
             if (res.status === 503) {
-                // Source didn't answer — explicitly NOT "unflagged" per the terms. Don't cache.
-                ids.forEach(id => this.inFlight.delete(id));
+                // Source didn't answer — explicitly NOT "unflagged" per the terms. Don't
+                // cache a result, but DO schedule a retry so this isn't stuck forever.
+                ids.forEach(id => { this.inFlight.delete(id); this.scheduleRetry(id); });
                 return;
             }
 
@@ -336,13 +372,24 @@ class ProviderLookup {
                 const now = Date.now();
                 for (const id of ids) {
                     const data = json.data[id];
-                    if (!data) continue;
+                    if (!data) {
+                        // Response came back fine but this specific id wasn't in it —
+                        // treat the same as any other failure, don't leave it hanging.
+                        this.scheduleRetry(id);
+                        continue;
+                    }
+                    this.retries.delete(id);
                     this.cache.set(id, { ...data, fetchedAt: now });
                 }
                 persistAllCaches();
+            } else {
+                // HTTP 200 but the API itself reported failure — this exact case had
+                // no handling before, which was the actual bug: nothing ever retried it.
+                ids.forEach(id => this.scheduleRetry(id));
             }
         } catch (e) {
             console.error(`[RotectorFlags] ${this.kind}/${this.provider} lookup failed`, e);
+            ids.forEach(id => this.scheduleRetry(id));
         } finally {
             ids.forEach(id => { this.inFlight.delete(id); this.notify(id); });
             if (this.pending.size) this.flushTimer = setTimeout(() => this.flush(), 250);
@@ -449,6 +496,10 @@ const PAST_OFFENDER: Omit<FlagVisual, "glyph" | "label"> = { bg: "#a35cff2e", fg
 const ORANGE_MERGE: Omit<FlagVisual, "glyph" | "label"> = { bg: "#e67e222e", fg: "#e67e22" };
 const CHECKING_VISUAL: FlagVisual = { bg: "#80848e1a", fg: "#80848e", glyph: "…", label: "Checking…" };
 const NOT_CONFIGURED_VISUAL: FlagVisual = { bg: "#80848e1a", fg: "#80848e", glyph: "–", label: "No API key set" };
+// Deliberately grey, not red/orange — this is "couldn't reach the provider",
+// not a finding. Same glyph as "Flagged" would be confusing in red, so this
+// stays neutral and the label does the explaining.
+const LOOKUP_FAILED_VISUAL: FlagVisual = { bg: "#80848e1a", fg: "#80848e", glyph: "!", label: "Lookup failed" };
 
 const GLYPH_OVERRIDES: Record<number, string> = {
     0: "✓", 1: "!", 2: "!", 3: "…", 4: "?", 5: "?", 6: "✓", 8: "×",
@@ -467,6 +518,7 @@ function getProviderVisual(providerId: AnyProviderId, flag: FlagEntry | undefine
     const flagType = flag?.flagType;
     if (flagType === undefined) return CHECKING_VISUAL;
     if (flagType === NOT_CONFIGURED_FLAG) return NOT_CONFIGURED_VISUAL;
+    if (flagType === LOOKUP_FAILED_FLAG) return LOOKUP_FAILED_VISUAL;
 
     // Actionable (Flagged/Confirmed) accounts split further by how many
     // distinct servers back the finding: 1 server reads as "mixed" (yellow),
@@ -507,7 +559,8 @@ interface Aggregate extends FlagVisual {
     orangeBy: string[]; // exactly 2 servers under that company — orange on its own
     mixedBy: string[]; // 0-1 servers — the weak "mixed" signal
     clearFrom: string[];
-    pendingFrom: string[];
+    pendingFrom: string[]; // still actively waiting on a response
+    failedFrom: string[]; // gave up after MAX_RETRIES — terminal, not "still loading"
     notConfigured: boolean;
 }
 function aggregate(flags: Partial<Record<ProviderId, FlagEntry>>): Aggregate {
@@ -516,6 +569,7 @@ function aggregate(flags: Partial<Record<ProviderId, FlagEntry>>): Aggregate {
     const mixedBy: string[] = [];
     const clearFrom: string[] = [];
     const pendingFrom: string[] = [];
+    const failedFrom: string[] = [];
     let notConfiguredCount = 0;
 
     for (const p of DISCORD_PROVIDERS) {
@@ -523,6 +577,12 @@ function aggregate(flags: Partial<Record<ProviderId, FlagEntry>>): Aggregate {
         const name = providerDisplayName(p);
         if (!entry) { pendingFrom.push(name); continue; }
         if (entry.flagType === NOT_CONFIGURED_FLAG) { notConfiguredCount++; continue; }
+        // A provider that failed every retry is done trying, not "still
+        // checking" — it must NOT fall into the actionable/clear branches
+        // below (flagType -3 isn't a real classification), and it must NOT
+        // keep the whole badge stuck on the checking glyph the way an
+        // entry in pendingFrom would.
+        if (entry.flagType === LOOKUP_FAILED_FLAG) { failedFrom.push(name); continue; }
         if (isActionable(entry.flagType)) {
             const count = distinctServerCount(entry);
             if (count >= 3) flaggedBy.push(name);
@@ -532,30 +592,33 @@ function aggregate(flags: Partial<Record<ProviderId, FlagEntry>>): Aggregate {
             clearFrom.push(name);
         }
     }
+    const base = { flaggedBy, orangeBy, mixedBy, clearFrom, pendingFrom, failedFrom };
 
     if (notConfiguredCount === DISCORD_PROVIDERS.length) {
-        return { ...NOT_CONFIGURED_VISUAL, flaggedBy, orangeBy, mixedBy, clearFrom, pendingFrom, notConfigured: true };
+        return { ...NOT_CONFIGURED_VISUAL, ...base, notConfigured: true };
     }
     // Red: either a company already hit its own 3+-server threshold, or
     // corroboration is broad enough (more than 3 companies showing a flag
     // at all, any severity) that it reads as red regardless.
     if (flaggedBy.length || flaggedBy.length + orangeBy.length + mixedBy.length > 3) {
-        return { ...TONE_VISUALS.unsafe, glyph: "!", label: "Flagged", flaggedBy, orangeBy, mixedBy, clearFrom, pendingFrom, notConfigured: false };
+        return { ...TONE_VISUALS.unsafe, glyph: "!", label: "Flagged", ...base, notConfigured: false };
     }
     // Orange: either a single company already sits at its own 2-server
     // threshold, or 2+ companies each independently report the weaker
     // 0-1-server "mixed" signal — no one of them is damning, but agreement
     // across several is.
     if (orangeBy.length || mixedBy.length >= 2) {
-        return { ...ORANGE_MERGE, glyph: "!", label: "Mixed — multiple servers/companies", flaggedBy, orangeBy, mixedBy, clearFrom, pendingFrom, notConfigured: false };
+        return { ...ORANGE_MERGE, glyph: "!", label: "Mixed — multiple servers/companies", ...base, notConfigured: false };
     }
     if (mixedBy.length === 1) {
-        return { ...TONE_VISUALS.mixed, glyph: "?", label: "Mixed", flaggedBy, orangeBy, mixedBy, clearFrom, pendingFrom, notConfigured: false };
+        return { ...TONE_VISUALS.mixed, glyph: "?", label: "Mixed", ...base, notConfigured: false };
     }
     if (pendingFrom.length) {
-        return { ...CHECKING_VISUAL, flaggedBy, orangeBy, mixedBy, clearFrom, pendingFrom, notConfigured: false };
+        return { ...CHECKING_VISUAL, ...base, notConfigured: false };
     }
-    return { ...TONE_VISUALS.safe, glyph: "✓", label: "No flags found", flaggedBy, orangeBy, mixedBy, clearFrom, pendingFrom, notConfigured: false };
+    // Every provider has now answered one way or another (resolved, failed,
+    // or not configured) — a dead provider never blocks this from settling.
+    return { ...TONE_VISUALS.safe, glyph: "✓", label: "No flags found", ...base, notConfigured: false };
 }
 
 function FlagIcon({ visual, size = 14 }: { visual: FlagVisual; size?: number; }) {
@@ -579,6 +642,7 @@ function tooltipText(agg: Aggregate): string {
     const anyFlag = agg.flaggedBy.length || agg.orangeBy.length || agg.mixedBy.length;
     if (agg.clearFrom.length) lines.push(`${anyFlag ? "Clear" : "No flags"}: ${agg.clearFrom.join(", ")}`);
     if (agg.pendingFrom.length) lines.push(`Checking: ${agg.pendingFrom.join(", ")}`);
+    if (agg.failedFrom.length) lines.push(`Couldn't reach: ${agg.failedFrom.join(", ")} (click for a manual retry)`);
     if (!anyFlag) lines.push("(not a guarantee of safety)");
     lines.push("Click for details");
     return lines.join("\n");
@@ -696,7 +760,7 @@ function ProviderSection({ providerId, flag, discordId }: { providerId: Provider
     const visual = getProviderVisual(providerId, flag, { serverSplit: true });
     const logo = ProviderLogos[providerId];
     const isBusy = !flag || flag.flagType === undefined;
-    const isRealResult = flag && flag.flagType !== NOT_CONFIGURED_FLAG;
+    const isRealResult = flag && flag.flagType !== NOT_CONFIGURED_FLAG && flag.flagType !== LOOKUP_FAILED_FLAG;
 
     return (
         <div style={{
@@ -728,7 +792,9 @@ function ProviderSection({ providerId, flag, discordId }: { providerId: Provider
                         ? "No violations detected yet — not a guarantee of safety."
                         : flag?.flagType === NOT_CONFIGURED_FLAG
                             ? "Set your Rayward API key to check this company."
-                            : "No reasons recorded for this status."}
+                            : flag?.flagType === LOOKUP_FAILED_FLAG
+                                ? "Couldn't reach this provider after several attempts — click ↻ to try again."
+                                : "No reasons recorded for this status."}
                 </Forms.FormText>
             ) : (
                 flag.reasons.map((reason, i) => (
@@ -755,7 +821,7 @@ function RobloxProviderSection({ providerId, flag, robloxId }: { providerId: Rob
     const visual = getProviderVisual(providerId, flag);
     const logo = ProviderLogos[providerId];
     const isBusy = !flag || flag.flagType === undefined;
-    const isRealResult = flag && flag.flagType !== NOT_CONFIGURED_FLAG;
+    const isRealResult = flag && flag.flagType !== NOT_CONFIGURED_FLAG && flag.flagType !== LOOKUP_FAILED_FLAG;
     const meta = robloxMetaLine(flag);
 
     return (
@@ -789,7 +855,9 @@ function RobloxProviderSection({ providerId, flag, robloxId }: { providerId: Rob
                         ? "No violations detected yet — not a guarantee of safety."
                         : flag?.flagType === NOT_CONFIGURED_FLAG
                             ? "Set your Rayward API key to check this company."
-                            : "No reasons recorded for this status."}
+                            : flag?.flagType === LOOKUP_FAILED_FLAG
+                                ? "Couldn't reach this provider after several attempts — click ↻ to try again."
+                                : "No reasons recorded for this status."}
                 </Forms.FormText>
             ) : (
                 flag.reasons.map((reason, i) => (
