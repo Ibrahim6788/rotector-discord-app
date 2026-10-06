@@ -95,13 +95,14 @@ const settings = definePluginSettings({
 // Providers
 // ---------------------------------------------------------------------------
 
-// RAB has no /v2/lookup/rab/discord/user endpoint (Roblox-only per its spec),
-// so it's excluded from the Discord provider set below — but it's included
-// in the Roblox set, where it's fully supported.
+// RAB and RCR have no Discord lookup endpoint (both Roblox-only per their
+// specs — RCR's own description explicitly lists "discord" among what it
+// does NOT cover), so they're excluded from the Discord provider set below
+// but included in the Roblox set, where both are fully supported.
 const DISCORD_PROVIDERS = ["rotector", "tase", "serversweep", "okappiki"] as const;
 type ProviderId = typeof DISCORD_PROVIDERS[number];
 
-const ROBLOX_PROVIDERS = ["rotector", "tase", "serversweep", "okappiki", "rab"] as const;
+const ROBLOX_PROVIDERS = ["rotector", "tase", "serversweep", "okappiki", "rab", "rcr"] as const;
 type RobloxProviderId = typeof ROBLOX_PROVIDERS[number];
 
 const API_BASE = "https://roscoe.rayward.app";
@@ -213,6 +214,7 @@ interface FlagEntry {
     lastUpdated?: number;
     category?: string;
     categoryLabel?: string;
+    recordUrls?: string[]; // links to the provider's own page for this account's full record — RCR introduced this field
     fetchedAt: number;
 }
 
@@ -243,7 +245,7 @@ function distinctServerCount(flag: FlagEntry | undefined): number {
 }
 
 type LookupKind = "discord" | "roblox";
-type AnyProviderId = "rotector" | "tase" | "serversweep" | "okappiki" | "rab";
+type AnyProviderId = "rotector" | "tase" | "serversweep" | "okappiki" | "rab" | "rcr";
 
 // Fixed brand colors for each company's left accent bar. Hardcoded rather
 // than pulled from /v2/providers' accentColor field — that metadata was
@@ -255,6 +257,7 @@ const PROVIDER_ACCENT_COLORS: Record<AnyProviderId, string> = {
     serversweep: "#e67e22",
     okappiki: "#f0d020",
     rab: "#8b5cf6",
+    rcr: "#a3342f", // RCR's own logo red
 };
 
 class ProviderLookup {
@@ -502,11 +505,12 @@ const NOT_CONFIGURED_VISUAL: FlagVisual = { bg: "#80848e1a", fg: "#80848e", glyp
 const LOOKUP_FAILED_VISUAL: FlagVisual = { bg: "#80848e1a", fg: "#80848e", glyph: "!", label: "Lookup failed" };
 
 const GLYPH_OVERRIDES: Record<number, string> = {
-    0: "✓", 1: "!", 2: "!", 3: "…", 4: "?", 5: "?", 6: "✓", 8: "×",
+    0: "✓", 1: "!", 2: "!", 3: "…", 4: "?", 5: "?", 6: "✓", 8: "×", 10: "…",
 };
 const FALLBACK_NAMES: Record<number, string> = {
     0: "No flag on record", 1: "Flagged", 2: "Confirmed", 3: "Queued",
     4: "Provisional", 5: "Mixed", 6: "Past Offender", 8: "Redacted",
+    10: "Awaiting Review", // RCR-specific value: "not a finding" per its own spec, same bucket as Queued
 };
 
 // Per-company status icon (used inside the details modal, one per section).
@@ -849,6 +853,15 @@ function RobloxProviderSection({ providerId, flag, robloxId }: { providerId: Rob
                 </Text>
             )}
             {meta && <Text variant="text-xs/normal" style={{ opacity: 0.6, marginBottom: 4, display: "block" }}>{meta}</Text>}
+            {!!flag?.recordUrls?.length && (
+                <div style={{ marginBottom: 4, display: "flex", gap: 10, flexWrap: "wrap" }}>
+                    {flag.recordUrls.map((url, i) => (
+                        <a key={i} href={url} target="_blank" rel="noreferrer" style={{ fontSize: 11, color: "var(--text-link)" }}>
+                            Full record on {providerDisplayName(providerId)} ↗
+                        </a>
+                    ))}
+                </div>
+            )}
             {!flag?.reasons?.length ? (
                 <Forms.FormText type="description">
                     {flag?.flagType === 0
